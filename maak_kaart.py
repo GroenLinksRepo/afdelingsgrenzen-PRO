@@ -45,9 +45,9 @@ for _, row in df.iterrows():
 afdelingen_sorted = sorted(set(d['afdeling'] for d in gemeente_data.values()))
 
 # --- Subsites op progressiefnederland.nl ---
-# Subsites bestaan per gemeente als subdomein (bv. aaenhunze., etten-leur.), soms ook
-# onder de afdelingsnaam (gemert-bakel.). Er is geen wildcard-DNS, dus een subdomein dat
-# resolvet is een echte site. Handmatige uitzonderingen in SITE_OVERRIDES.
+# Lokale websites bestaan per gemeente als subdomein (bv. aaenhunze., etten-leur.).
+# Er is geen wildcard-DNS, dus een subdomein dat resolvet is een echte site.
+# Afwijkende namen in SITE_OVERRIDES.
 PRO_DOMEIN = 'progressiefnederland.nl'
 SITE_OVERRIDES = {'s-Gravenhage': 'denhaag', 's-Hertogenbosch': 'denbosch'}
 GEEN_SITE_URL = 'https://progressiefnederland.nl/doe-mee/'
@@ -75,24 +75,22 @@ def bestaat(sub):
 
 gem_kand = {g: ([SITE_OVERRIDES[g]] if g in SITE_OVERRIDES else []) + site_varianten(g)
             for g in gemeente_data}
-afd_kand = {a: site_varianten(a) for a in afdelingen_sorted}
-alle_kand = sorted({s for k in list(gem_kand.values()) + list(afd_kand.values()) for s in k})
+alle_kand = sorted({s for k in gem_kand.values() for s in k})
 with ThreadPoolExecutor(16) as ex:
     bestaand = dict(zip(alle_kand, ex.map(bestaat, alle_kand)))
 
 gem_site = {g: next((s for s in k if bestaand[s]), None) for g, k in gem_kand.items()}
-afd_site = {a: next((s for s in k if bestaand[s]), None) for a, k in afd_kand.items()}
 afd_gemeenten = {}
 for g, d in sorted(gemeente_data.items()):
     afd_gemeenten.setdefault(d['afdeling'], []).append(g)
 
 
-def links_voor(gemeente, afdeling):
-    """Eigen gemeentesite → site onder afdelingsnaam → site(s) van andere gemeenten in de afdeling."""
-    eigen = gem_site.get(gemeente) or afd_site.get(afdeling)
-    if eigen:
-        return [{'url': f'https://{eigen}.{PRO_DOMEIN}/', 'label': 'Direct naar deze afdeling'}]
-    return [{'url': f'https://{gem_site[g]}.{PRO_DOMEIN}/', 'label': g}
+def links_voor(gemeente, weergavenaam, afdeling):
+    """Eigen gemeentesite, anders de sites van andere gemeenten binnen dezelfde afdeling."""
+    if gem_site.get(gemeente):
+        return [{'url': f'https://{gem_site[gemeente]}.{PRO_DOMEIN}/', 'eigen': True,
+                 'label': f'Naar de lokale website van {weergavenaam}'}]
+    return [{'url': f'https://{gem_site[g]}.{PRO_DOMEIN}/', 'eigen': False, 'label': g}
             for g in afd_gemeenten.get(afdeling, []) if gem_site.get(g)]
 
 
@@ -103,7 +101,7 @@ for feature in geo_data['features']:
     p = feature['properties']
     p['afdeling'] = afdeling
     p['gemeente_excel'] = excel_naam
-    p['links'] = links_voor(excel_naam, afdeling)
+    p['links'] = links_voor(excel_naam, geo_naam, afdeling)
 
 zonder_site = sorted(f['properties']['statnaam'] for f in geo_data['features']
                      if not f['properties']['links'])
@@ -538,10 +536,10 @@ window.addEventListener('load', function() {{
       var a = voegToe('a', 'gem-popup-knop' + (klein ? ' klein' : ''), label);
       a.href = url; a.target = '_blank'; a.rel = 'noopener';
     }}
-    if (links.length === 1) {{
+    if (links.length && links[0].eigen) {{
       knop(links[0].url, links[0].label);
-    }} else if (links.length > 1) {{
-      voegToe('div', 'gem-popup-tekst', 'Deze afdeling is online te vinden via:');
+    }} else if (links.length) {{
+      voegToe('div', 'gem-popup-tekst', 'Deze gemeente heeft nog geen eigen lokale website. Bekijk de lokale website van een andere gemeente binnen de afdeling:');
       links.forEach(function(l) {{ knop(l.url, l.label, true); }});
     }} else {{
       voegToe('div', 'gem-popup-tekst', 'Deze afdeling heeft nog geen eigen website.');
