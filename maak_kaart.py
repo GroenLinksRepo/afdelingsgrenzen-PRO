@@ -1,3 +1,7 @@
+import re
+import socket
+import unicodedata
+from concurrent.futures import ThreadPoolExecutor
 import requests
 import json
 import pandas as pd
@@ -36,29 +40,73 @@ for _, row in df.iterrows():
     gemeente = str(row['Gemeente']).strip()
     if gemeente in ('nan', 'Brussel / België', 'Buitenland'):
         continue
-    afdeling = str(row['Naam Lokale Afdeling']).strip()
-    bestuursleden = {}
-    for col in ['i-Voorzitter', 'i-Secretaris', 'i-Penningmeester', 'i-Algemeen Bestuurslid']:
-        val = row.get(col, '')
-        if pd.notna(val) and str(val).strip() not in ('nan', ''):
-            bestuursleden[col] = str(val).strip()
-    gemeente_data[gemeente] = {'afdeling': afdeling, 'bestuursleden': bestuursleden}
+    gemeente_data[gemeente] = {'afdeling': str(row['Naam Lokale Afdeling']).strip()}
 
 afdelingen_sorted = sorted(set(d['afdeling'] for d in gemeente_data.values()))
+
+# --- Subsites op progressiefnederland.nl ---
+# Subsites bestaan per gemeente als subdomein (bv. aaenhunze., etten-leur.), soms ook
+# onder de afdelingsnaam (gemert-bakel.). Er is geen wildcard-DNS, dus een subdomein dat
+# resolvet is een echte site. Handmatige uitzonderingen in SITE_OVERRIDES.
+PRO_DOMEIN = 'progressiefnederland.nl'
+SITE_OVERRIDES = {'s-Gravenhage': 'denhaag', 's-Hertogenbosch': 'denbosch'}
+GEEN_SITE_URL = 'https://progressiefnederland.nl/doe-mee/'
+
+
+def site_varianten(naam):
+    volledig = unicodedata.normalize('NFKD', naam).encode('ascii', 'ignore').decode().lower().replace("'", '')
+    s = re.sub(r'\(.*?\)', '', volledig).strip()
+    return list(dict.fromkeys([
+        re.sub(r'[^a-z0-9-]', '', s),
+        re.sub(r'[^a-z0-9]', '', s),
+        re.sub(r'[^a-z0-9]+', '-', s).strip('-'),
+        re.sub(r'[^a-z0-9]+', '-', volledig).strip('-'),     # Bergen (NH) → bergen-nh
+        re.sub(r'[^a-z0-9-]', '', s.split(',')[0]),          # Nuenen, Gerwen en … → nuenen
+    ]))
+
+
+def bestaat(sub):
+    try:
+        socket.gethostbyname(f'{sub}.{PRO_DOMEIN}')
+        return True
+    except OSError:
+        return False
+
+
+gem_kand = {g: ([SITE_OVERRIDES[g]] if g in SITE_OVERRIDES else []) + site_varianten(g)
+            for g in gemeente_data}
+afd_kand = {a: site_varianten(a) for a in afdelingen_sorted}
+alle_kand = sorted({s for k in list(gem_kand.values()) + list(afd_kand.values()) for s in k})
+with ThreadPoolExecutor(16) as ex:
+    bestaand = dict(zip(alle_kand, ex.map(bestaat, alle_kand)))
+
+gem_site = {g: next((s for s in k if bestaand[s]), None) for g, k in gem_kand.items()}
+afd_site = {a: next((s for s in k if bestaand[s]), None) for a, k in afd_kand.items()}
+afd_gemeenten = {}
+for g, d in sorted(gemeente_data.items()):
+    afd_gemeenten.setdefault(d['afdeling'], []).append(g)
+
+
+def links_voor(gemeente, afdeling):
+    """Eigen gemeentesite → site onder afdelingsnaam → site(s) van andere gemeenten in de afdeling."""
+    eigen = gem_site.get(gemeente) or afd_site.get(afdeling)
+    if eigen:
+        return [{'url': f'https://{eigen}.{PRO_DOMEIN}/', 'label': 'Direct naar deze afdeling'}]
+    return [{'url': f'https://{gem_site[g]}.{PRO_DOMEIN}/', 'label': g}
+            for g in afd_gemeenten.get(afdeling, []) if gem_site.get(g)]
+
 
 for feature in geo_data['features']:
     geo_naam = feature['properties']['statnaam']
     excel_naam = name_map.get(geo_naam, geo_naam)
-    data = gemeente_data.get(excel_naam, {})
-    afdeling = data.get('afdeling', 'Onbekend')
-    bestuursleden = data.get('bestuursleden', {})
+    afdeling = gemeente_data.get(excel_naam, {}).get('afdeling', 'Onbekend')
     p = feature['properties']
     p['afdeling'] = afdeling
     p['gemeente_excel'] = excel_naam
-    p['i-Voorzitter'] = bestuursleden.get('i-Voorzitter', '')
-    p['i-Secretaris'] = bestuursleden.get('i-Secretaris', '')
-    p['i-Penningmeester'] = bestuursleden.get('i-Penningmeester', '')
-    p['i-Algemeen Bestuurslid'] = bestuursleden.get('i-Algemeen Bestuurslid', '')
+    p['links'] = links_voor(excel_naam, afdeling)
+
+zonder_site = sorted(f['properties']['statnaam'] for f in geo_data['features']
+                     if not f['properties']['links'])
 
 gdf = gpd.GeoDataFrame.from_features(geo_data['features'])
 
@@ -126,13 +174,14 @@ for naam, (gem_lat, gem_lon) in gemeente_centroids.items():
 
 # --- Folium kaart ---
 m = folium.Map(
-    location=[52.3, 5.3],
-    zoom_start=7,
+    location=[52.2, 5.45],
+    zoom_start=8,
     tiles='https://service.pdok.nl/brt/achtergrondkaart/wmts/v2_0/grijs/EPSG:3857/{z}/{x}/{y}.png',
     attr='Kaartgegevens &copy; <a href="https://www.kadaster.nl">Kadaster</a>',
     min_zoom=6,
     max_zoom=13,
     zoom_control=False,
+    zoom_snap=0.25,
 )
 
 # ── FeatureGroup 1: Gemeentegrenzen visueel (togglebaar, GEEN interactie) ──
@@ -175,7 +224,8 @@ for naam, (lat, lon) in gemeente_centroids.items():
             ),
             icon_size=(160, 14),
             icon_anchor=anchor,
-        )
+        ),
+        interactive=False,
     ).add_to(gem_namen_fg)
 gem_namen_fg.add_to(m)
 
@@ -197,7 +247,8 @@ for afdeling, (lat, lon) in afdeling_centroids.items():
             ),
             icon_size=(220, 20),
             icon_anchor=(110, 10),
-        )
+        ),
+        interactive=False,
     ).add_to(afd_namen_fg)
 afd_namen_fg.add_to(m)
 
@@ -292,13 +343,6 @@ custom_html = f"""
   .badge-gem {{ background: #555; }}
   .badge-afd {{ background: var(--groen); }}
 
-  /* ── Attributie ── */
-  #attributie {{
-    position: fixed; bottom: 6px; left: 10px; z-index: 999;
-    font-family: var(--font-body); font-size: 10px;
-    color: #555; pointer-events: none;
-  }}
-
   /* ── Popup ── */
   .gem-popup {{
     position: fixed; z-index: 2000;
@@ -315,9 +359,15 @@ custom_html = f"""
     color: var(--groen); font-size: 11px; font-weight: 700;
     letter-spacing: 0.04em; text-transform: uppercase; margin-bottom: 10px;
   }}
-  .gem-popup-rij {{ font-size: 12px; margin: 3px 0; color: #333; }}
-  .gem-popup-rij b {{ color: #111; }}
-  .gem-popup-leeg {{ font-size: 11px; color: #777; margin-top: 4px; }}
+  .gem-popup-knop {{
+    display: block; margin-top: 6px; padding: 8px 12px;
+    background: var(--groen); color: white !important; text-decoration: none;
+    font-family: var(--font-kop); font-size: 14px;
+    letter-spacing: 0.05em; text-transform: uppercase; text-align: center;
+  }}
+  .gem-popup-knop:hover {{ background: #008800; }}
+  .gem-popup-knop.klein {{ font-size: 12px; padding: 6px 10px; }}
+  .gem-popup-tekst {{ font-size: 12px; color: #333; margin: 2px 0 4px; }}
   .gem-popup-sluit {{
     position: absolute; top: 8px; right: 10px;
     background: none; border: none; font-size: 16px;
@@ -380,8 +430,6 @@ custom_html = f"""
   <div id="zoek-resultaten"></div>
 </div>
 
-<div id="attributie">door Emiel Janssens, voor Luuk Mevis</div>
-
 <script>
 window.addEventListener('load', function() {{
   var kaart      = window['{map_var}'];
@@ -411,6 +459,9 @@ window.addEventListener('load', function() {{
       return {{ color: '#FF77AA', weight: 2.5, opacity: 1.0 }};
     }}
   }}).addTo(kaart);
+
+  // ── Beginbeeld: het grootste deel van NL, ruimte boven voor titel + zoekbalk ──
+  kaart.fitBounds([[51.2, 3.9], [53.3, 7.0]], {{ paddingTopLeft: [0, 90], animate: false }});
 
   // ── Toolbar ─────────────────────────────────────────────────────────────
   document.getElementById('zoom-in') .addEventListener('click', function() {{ kaart.zoomIn();  }});
@@ -470,27 +521,36 @@ window.addEventListener('load', function() {{
   geolaag.on('click', function(e) {{
     if (activePopup) {{ activePopup.remove(); activePopup = null; }}
     var p = e.layer.feature.properties;
-    var rollen = [
-      ['Voorzitter',       p['i-Voorzitter']],
-      ['Secretaris',       p['i-Secretaris']],
-      ['Penningmeester',   p['i-Penningmeester']],
-      ['Alg. bestuurslid', p['i-Algemeen Bestuurslid']],
-    ].filter(function(r) {{ return r[1] && r[1].trim(); }});
+    var links = p.links || [];
     var el = document.createElement('div');
     el.className = 'gem-popup';
-    el.innerHTML =
-      '<button class="gem-popup-sluit">&#10005;</button>' +
-      '<div class="gem-popup-titel">' + p.statnaam + '</div>' +
-      '<div class="gem-popup-afd">'   + (p.afdeling || '') + '</div>' +
-      (rollen.length
-        ? rollen.map(function(r) {{
-            return '<div class="gem-popup-rij"><b>' + r[0] + ':</b> ' + r[1] + '</div>';
-          }}).join('')
-        : '<div class="gem-popup-leeg">Nog geen bestuursinfo ingevuld</div>');
+    function voegToe(tag, cls, tekst) {{
+      var n = document.createElement(tag);
+      n.className = cls;
+      if (tekst) n.textContent = tekst;
+      el.appendChild(n);
+      return n;
+    }}
+    voegToe('button', 'gem-popup-sluit').innerHTML = '&#10005;';
+    voegToe('div', 'gem-popup-titel', p.statnaam);
+    voegToe('div', 'gem-popup-afd', p.afdeling || '');
+    function knop(url, label, klein) {{
+      var a = voegToe('a', 'gem-popup-knop' + (klein ? ' klein' : ''), label);
+      a.href = url; a.target = '_blank'; a.rel = 'noopener';
+    }}
+    if (links.length === 1) {{
+      knop(links[0].url, links[0].label);
+    }} else if (links.length > 1) {{
+      voegToe('div', 'gem-popup-tekst', 'Deze afdeling is online te vinden via:');
+      links.forEach(function(l) {{ knop(l.url, l.label, true); }});
+    }} else {{
+      voegToe('div', 'gem-popup-tekst', 'Deze afdeling heeft nog geen eigen website.');
+      knop('{GEEN_SITE_URL}', 'Doe mee met PRO');
+    }}
     el.querySelector('.gem-popup-sluit').onclick = function() {{ el.remove(); activePopup = null; }};
-    el.style.left = Math.min(e.originalEvent.clientX + 12, window.innerWidth  - 300) + 'px';
-    el.style.top  = Math.min(e.originalEvent.clientY - 10, window.innerHeight - 200) + 'px';
     document.body.appendChild(el);
+    el.style.left = Math.max(10, Math.min(e.originalEvent.clientX + 12, window.innerWidth  - el.offsetWidth  - 10)) + 'px';
+    el.style.top  = Math.max(10, Math.min(e.originalEvent.clientY - 10, window.innerHeight - el.offsetHeight - 10)) + 'px';
     activePopup = el;
     L.DomEvent.stopPropagation(e);
   }});
@@ -593,3 +653,5 @@ n_normal  = sum(1 for m in gemeente_label_mode.values() if m == 'normal')
 n_offset  = sum(1 for m in gemeente_label_mode.values() if m == 'offset')
 n_suppress = sum(1 for m in gemeente_label_mode.values() if m == 'suppress')
 print(f'Gemeente-labels: {n_normal} normaal, {n_offset} onder afd-label, {n_suppress} onderdrukt')
+print(f'Subsites: {len(geo_data["features"]) - len(zonder_site)} gemeenten gekoppeld, '
+      f'{len(zonder_site)} zonder site in hun afdeling: {", ".join(zonder_site)}')
